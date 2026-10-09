@@ -1,0 +1,8 @@
+[package]
+name = "ping"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ctrlc = "3.5"
+nix = { version = "0.31", features = ["net", "poll", "socket", "uio"] }

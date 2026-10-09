@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = x86_64
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo files
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag and package versions
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Tag must match vX.Y.Z: %s\n' "$GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          export RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json
+          import os
+          import sys
+
+          metadata = json.load(sys.stdin)
+          member_ids = set(metadata["workspace_members"])
+          packages = [package for package in metadata["packages"] if package["id"] in member_ids]
+          versions = {package["version"] for package in packages}
+          expected = os.environ["RELEASE_VERSION"]
+
+          if not packages or versions != {expected}:
+              print(f"Tag version {expected} does not match workspace package versions {sorted(versions)}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Tag version {expected} matches all {len(packages)} workspace package(s)")
+          '
+
+      - name: Verify, test, and build release binaries
+        run: |
+          cargo fmt --all -- --check
+          cargo check --workspace --all-targets
+          cargo test --workspace
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo build --workspace --release
+
+      - name: Package workspace binaries
+        run: |
+          binaries_dir="$RUNNER_TEMP/release-binaries"
+          mkdir -p "$binaries_dir" "$GITHUB_WORKSPACE/dist"
+          mapfile -d '' binary_names < <(
+            cargo metadata --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
+
+          metadata = json.load(sys.stdin)
+          member_ids = set(metadata["workspace_members"])
+          packages = [package for package in metadata["packages"] if package["id"] in member_ids]
+          names = sorted({
+              target["name"]
+              for package in packages
+              for target in package["targets"]
+              if "bin" in target["kind"]
+          })
+
+          for name in names:
+              sys.stdout.buffer.write(name.encode() + b"\0")
+          '
+          )
+          if (( ${#binary_names[@]} == 0 )); then
+            printf 'No workspace binary targets found\n' >&2
+            exit 1
+          fi
+          for binary_name in "${binary_names[@]}"; do
+            binary="$GITHUB_WORKSPACE/target/release/$binary_name"
+            if [[ ! -f "$binary" || ! -x "$binary" ]]; then
+              printf 'Workspace binary not found or not executable: %s\n' "$binary_name" >&2
+              exit 1
+            fi
+            cp "$binary" "$binaries_dir/"
+          done
+          cp "$GITHUB_WORKSPACE/LICENSE" "$binaries_dir/"
+          archive="$GITHUB_WORKSPACE/dist/rustutils-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          tar -czf "$archive" -C "$binaries_dir" .
+          tar -tzf "$archive"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ github.workspace }}/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/*.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: true
